@@ -54,12 +54,20 @@ jobs:
           run_cmd() {
             local output="$1"
             shift
+
+            # Keep stdout as pure command output (usually JSON).
+            # Command metadata is written separately so jq/json parsers do not fail.
             {
               printf 'COMMAND:'
               printf ' %q' "$@"
-              printf '\n\n'
-              "$@"
-            } >"${output}.stdout" 2>"${output}.stderr" || echo "$?" >"${output}.exit"
+              printf '\n'
+            } >"${output}.command"
+
+            if "$@" >"${output}.stdout" 2>"${output}.stderr"; then
+              rm -f "${output}.exit"
+            else
+              printf '%s\n' "$?" >"${output}.exit"
+            fi
           }
 
           run_cmd recon/global/sts_identity aws sts get-caller-identity --output json
@@ -75,7 +83,7 @@ jobs:
 
           # Fetch the current role's inline and managed policy documents when permitted.
           if jq -e '.PolicyNames' recon/global/iam_list_entry_inline.stdout >/dev/null 2>&1; then
-            jq -r '.PolicyNames[]' recon/global/iam_list_entry_inline.stdout | while IFS= read -r policy; do
+            (jq -r '.PolicyNames[]?' recon/global/iam_list_entry_inline.stdout 2>/dev/null || true) | while IFS= read -r policy; do
               safe="$(printf '%s' "${policy}" | tr -c 'A-Za-z0-9_.-' '_')"
               run_cmd "recon/global/iam_entry_inline_${safe}" \
                 aws iam get-role-policy --role-name metricforge-entry-b8358a07fc --policy-name "${policy}" --output json
@@ -83,7 +91,7 @@ jobs:
           fi
 
           if jq -e '.AttachedPolicies' recon/global/iam_list_entry_attached.stdout >/dev/null 2>&1; then
-            jq -r '.AttachedPolicies[].PolicyArn' recon/global/iam_list_entry_attached.stdout | while IFS= read -r arn; do
+            (jq -r '.AttachedPolicies[]?.PolicyArn' recon/global/iam_list_entry_attached.stdout 2>/dev/null || true) | while IFS= read -r arn; do
               safe="$(printf '%s' "${arn}" | tr -c 'A-Za-z0-9_.-' '_')"
               run_cmd "recon/global/iam_managed_${safe}" aws iam get-policy --policy-arn "${arn}" --output json
               meta="recon/global/iam_managed_${safe}.stdout"
@@ -152,7 +160,7 @@ jobs:
 
           # Read discoverable S3 objects, capped to small challenge artifacts.
           if jq -e '.Buckets' recon/global/s3_list_buckets.stdout >/dev/null 2>&1; then
-            jq -r '.Buckets[].Name' recon/global/s3_list_buckets.stdout | while IFS= read -r bucket; do
+            (jq -r '.Buckets[]?.Name' recon/global/s3_list_buckets.stdout 2>/dev/null || true) | while IFS= read -r bucket; do
               safe_bucket="$(printf '%s' "${bucket}" | tr -c 'A-Za-z0-9_.-' '_')"
               run_cmd "recon/global/s3_${safe_bucket}_location" \
                 aws s3api get-bucket-location --bucket "${bucket}" --output json
@@ -161,7 +169,7 @@ jobs:
 
               listing="recon/global/s3_${safe_bucket}_objects.stdout"
               if jq -e '.Contents' "${listing}" >/dev/null 2>&1; then
-                jq -r '.Contents[] | select(.Size <= 2097152) | [.Key, (.Size|tostring)] | @base64' "${listing}" |
+                (jq -r '.Contents[]? | select(.Size <= 2097152) | [.Key, (.Size|tostring)] | @base64' "${listing}" 2>/dev/null || true) |
                 while IFS= read -r row; do
                   decoded="$(printf '%s' "${row}" | base64 -d)"
                   key="$(printf '%s' "${decoded}" | jq -r '.[0]')"
@@ -180,7 +188,7 @@ jobs:
           # Read SSM parameters and Secrets Manager values when the entry role permits it.
           find recon/regions -name 'ssm_parameters.stdout' -print0 | while IFS= read -r -d '' listing; do
             region="$(basename "$(dirname "${listing}")")"
-            jq -r '.Parameters[]?.Name' "${listing}" 2>/dev/null | while IFS= read -r name; do
+            (jq -r '.Parameters[]?.Name' "${listing}" 2>/dev/null || true) | while IFS= read -r name; do
               safe="$(printf '%s' "${name}" | sha256sum | cut -c1-16)"
               run_cmd "recon/regions/${region}/ssm_value_${safe}" \
                 aws ssm get-parameter --region "${region}" --name "${name}" --with-decryption --output json
@@ -190,7 +198,7 @@ jobs:
 
           find recon/regions -name 'secrets.stdout' -print0 | while IFS= read -r -d '' listing; do
             region="$(basename "$(dirname "${listing}")")"
-            jq -r '.SecretList[]?.ARN' "${listing}" 2>/dev/null | while IFS= read -r arn; do
+            (jq -r '.SecretList[]?.ARN' "${listing}" 2>/dev/null || true) | while IFS= read -r arn; do
               safe="$(printf '%s' "${arn}" | sha256sum | cut -c1-16)"
               run_cmd "recon/regions/${region}/secret_value_${safe}" \
                 aws secretsmanager get-secret-value --region "${region}" --secret-id "${arn}" --output json
@@ -304,22 +312,23 @@ jobs:
             cat recon/global/sts_identity.stdout 2>/dev/null || true
             echo
             echo '=== AMI inventory ==='
-            cat recon/analysis/ami_inventory.json
+            cat recon/analysis/ami_inventory.json 2>/dev/null || true
             echo
             echo '=== MetricForge indicators ==='
-            cat recon/analysis/metricforge_lines.txt
+            cat recon/analysis/metricforge_lines.txt 2>/dev/null || true
             echo
             echo '=== DSSE candidates ==='
-            cat recon/analysis/dsse_candidates.json
+            cat recon/analysis/dsse_candidates.json 2>/dev/null || true
           } > recon/analysis/SUMMARY.txt
 
           # Do not retain the temporary STS credential in the final recon artifact.
           rm -rf session
 
       - name: Upload recon results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: metricforge-recon
           path: recon
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 1
